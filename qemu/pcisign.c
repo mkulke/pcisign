@@ -1,0 +1,458 @@
+// hw/crypto/pcisign.c
+
+#include "qemu/osdep.h"
+#include "qemu/error-report.h"
+#include "qemu/bitops.h"
+#include "crypto/hash.h"
+#include "crypto/akcipher.h"
+#include "hw/pci/msix.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/pci_ids.h"
+#include "hw/qdev-properties.h"
+#include "hw/irq.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "hw/boards.h"
+#include "qemu/typedefs.h"
+#include "qemu/main-loop.h"
+#include "qemu/queue.h"
+#include "hw/pci/msi.h"
+
+#define TYPE_PCI_SIGN_DEV "pcisign-dev"
+OBJECT_DECLARE_SIMPLE_TYPE(PCISignDevState, PCI_SIGN_DEV)
+
+#define PCISIGN_MSIX_BAR          1
+#define PCISIGN_MSIX_NUM_VECTORS  1
+
+typedef struct PCISignDevRegisters {
+    uint64_t src_addr;
+    uint32_t src_len;
+    uint64_t dst_addr;
+    uint32_t dst_len;
+    uint32_t ctrl;
+    uint32_t status;
+    uint32_t algo;
+} PCISignDevRegisters;
+
+typedef struct PCISignDevState {
+    PCIDevice parent_obj;
+
+    MemoryRegion mmio;
+
+    PCISignDevRegisters regs;
+
+    QemuMutex lock;
+
+    char *rsa_key_path;
+
+    QCryptoAkCipher *rsa_key;
+} PCISignDevState;
+
+#define REG_CTRL    0x00
+#define REG_STATUS  0x04
+#define REG_SRC_LO  0x08
+#define REG_SRC_HI  0x0c
+#define REG_SRC_LEN 0x10
+#define REG_DST_LO  0x14
+#define REG_DST_HI  0x18
+#define REG_DST_LEN 0x1c
+#define REG_ALGO    0x20
+
+#define CTRL_START     0x1
+#define CTRL_CMD_SHIFT 8
+#define CTRL_CMD_MASK  (0xff << CTRL_CMD_SHIFT)
+#define CMD_TEST       0x1
+#define CMD_SIGN       0x2
+
+#define STATUS_DONE 0x1
+#define STATUS_ERR  0x2
+
+static int rsa_sign(QCryptoAkCipher *rsa,
+                    const uint8_t *msg, size_t msg_len,
+                    uint8_t *sig, size_t sig_len)
+{
+    uint8_t *dgst;
+    size_t dgst_len = 0;
+    Error *local_err = NULL;
+    int ret;
+    size_t sig_max_len;
+
+    /* hash the message first */
+    ret = qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256,
+                             msg, msg_len,
+                             &dgst, &dgst_len, &local_err);
+    if (ret < 0) {
+        if (local_err) {
+            error_report_err(local_err);
+        }
+        g_free(dgst);
+        return -1;
+    }
+
+    /* sha256 should be 32 bytes */
+    if (dgst_len != 32) {
+        error_report("unexpected sha256 length %zu", dgst_len);
+        g_free(dgst);
+        return -1;
+    }
+
+    /* need to assert sig buffer is large enough */
+    sig_max_len = qcrypto_akcipher_max_signature_len(rsa);
+    if (sig_len < sig_max_len) {
+        error_report("signature buffer too small: %zu < %zu",
+                     sig_len, sig_max_len);
+        g_free(dgst);
+        return -1;
+    }
+
+    ret = qcrypto_akcipher_sign(rsa, dgst, dgst_len, sig, sig_len, &local_err);
+    g_free(dgst);
+    if (ret < 0) {
+        if (local_err) {
+            error_report_err(local_err);
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+static int fake_sha256_sign(const uint8_t *msg, size_t msg_len,
+                            uint8_t *sig, size_t sig_len)
+{
+    Error *local_err = NULL;
+    uint8_t *hash = NULL;
+    size_t hash_len = 0;
+    int ret;
+
+    /* One-shot hash */
+    ret = qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, msg, msg_len, &hash,
+                             &hash_len, &local_err);
+    if (ret < 0) {
+        if (local_err) {
+            error_report_err(local_err);
+        }
+        return -EIO;
+    }
+
+    if (hash_len > sig_len) {
+        g_free(hash);
+        return -EMSGSIZE;
+    }
+
+    memcpy(sig, hash, hash_len);
+    g_free(hash);
+
+    return 0;
+}
+
+static uint64_t pcisign_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PCISignDevState *s = opaque;
+    PCISignDevRegisters *r = &s->regs;
+
+    switch (addr) {
+    case REG_CTRL:
+        return r->ctrl;
+    case REG_STATUS:
+        return r->status;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad read at 0x%" HWADDR_PRIx "\n", __func__, addr);
+        return 0;
+    }
+}
+
+static void pcisign_complete(PCISignDevState *s, int err)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    PCISignDevRegisters *r = &s->regs;
+
+    if (err == 0) {
+        r->status |= STATUS_DONE;
+        r->status &= ~STATUS_ERR;
+    } else {
+        r->status |= STATUS_ERR;
+    }
+
+    /* raise interrupt */
+    if (msix_enabled(pdev)) {
+        msix_notify(pdev, 0);
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: completion but MSI-X not enabled\n", __func__);
+    }
+}
+
+static int do_sign(PCISignDevState *s,
+                   const uint8_t *msg, size_t msg_len,
+                   uint8_t *sig, size_t sig_len)
+{
+    PCISignDevRegisters *r = &s->regs;
+
+    switch (r->algo) {
+    case 1:
+        return rsa_sign(s->rsa_key, msg, msg_len, sig, sig_len);
+    case 2:
+        /* TODO: ecdsa */
+        return fake_sha256_sign(msg, msg_len, sig, sig_len);
+    default:
+        return -EINVAL;
+    }
+}
+
+static void pcisign_start_op(PCISignDevState *s)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    PCISignDevRegisters *r = &s->regs;
+    uint8_t cmd;
+    uint8_t *buf = NULL;
+    uint8_t *sig = NULL;
+    int ret;
+    size_t sig_len = 0;
+
+    qemu_mutex_lock(&s->lock);
+
+    cmd = (r->ctrl & CTRL_CMD_MASK) >> CTRL_CMD_SHIFT;
+    switch (cmd) {
+    case CMD_TEST:
+        pcisign_complete(s, 0);
+        break;
+    case CMD_SIGN:
+        /* input validation */
+        if (r->src_len == 0 || r->dst_len == 0) {
+            pcisign_complete(s, -EINVAL);
+            goto out;
+        }
+
+        /* read input data into buffer */
+        buf = g_malloc(r->src_len);
+        ret = pci_dma_read(pdev, r->src_addr, buf, r->src_len);
+        if (ret) {
+            pcisign_complete(s, ret);
+            goto out;
+        }
+
+        /* perform sign operation */
+        sig_len = r->dst_len;
+        sig = g_malloc0(sig_len);
+        ret = do_sign(s, buf, r->src_len, sig, sig_len);
+        if (ret) {
+            pcisign_complete(s, ret);
+            goto out;
+        }
+
+        /* signature doesn't fit in destination buffer */
+        if (sig_len > r->dst_len) {
+            pcisign_complete(s, -EMSGSIZE);
+            goto out;
+        }
+
+        /* write signature to destination buffer */
+        ret = pci_dma_write(pdev, r->dst_addr, sig, sig_len);
+        if (ret) {
+            pcisign_complete(s, ret);
+            goto out;
+        }
+
+        /* operation complete */
+        pcisign_complete(s, 0);
+        break;
+    default:
+        pcisign_complete(s, -EINVAL);
+        goto out;
+    }
+
+out:
+    g_free(buf);
+    g_free(sig);
+    qemu_mutex_unlock(&s->lock);
+}
+
+static void pcisign_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    PCISignDevState *s = opaque;
+    PCISignDevRegisters *r = &s->regs;
+
+    switch (addr) {
+    case REG_CTRL:
+        if (val & CTRL_START) {
+            r->ctrl = val;
+            pcisign_start_op(s);
+        }
+        break;
+    case REG_SRC_LO:
+        r->src_addr = deposit64(r->src_addr,  0, 32, (uint32_t)val);
+        break;
+    case REG_SRC_HI:
+        r->src_addr = deposit64(r->src_addr, 32, 32, (uint32_t)val);
+        break;
+    case REG_SRC_LEN:
+        r->src_len = (uint32_t)val;
+        break;
+    case REG_DST_LO:
+        r->dst_addr = deposit64(r->dst_addr,  0, 32, (uint32_t)val);
+        break;
+    case REG_DST_HI:
+        r->dst_addr = deposit64(r->dst_addr, 32, 32, (uint32_t)val);
+        break;
+    case REG_DST_LEN:
+        r->dst_len = (uint32_t)val;
+        break;
+    case REG_ALGO:
+        r->algo = (uint32_t)val;
+        break;
+    /* TODO: do we want writable status bits? */
+    case REG_STATUS:
+        r->status &= ~((uint32_t)val);
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad write at 0x%" HWADDR_PRIx "\n", __func__, addr);
+        break;
+    }
+}
+
+static const MemoryRegionOps pcisign_mmio_ops = {
+    .read       = pcisign_mmio_read,
+    .write      = pcisign_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid      = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void pcisign_init_keys(PCISignDevState *s, Error **errp)
+{
+    QCryptoAkCipherOptions opt = { 0 };
+    Error *local_err = NULL;
+    g_autofree uint8_t *key_buf = NULL;
+    gsize key_len = 0;
+    g_autoptr(GError) gerr = NULL;
+    int kt = QCRYPTO_AK_CIPHER_KEY_TYPE_PRIVATE;
+
+    if (!s->rsa_key_path) {
+        error_setg(errp, "pcisign: missing required property 'rsa-key'");
+        return;
+    }
+
+    /* load RSA private key file (binary DER w/ -traditional in openssl) */
+    if (!g_file_get_contents(s->rsa_key_path,
+                             (char**) &key_buf, &key_len,
+                             &gerr)) {
+        error_setg(errp, "pcisign: failed to read 'rsa-key' from %s: %s",
+                   s->rsa_key_path, gerr->message);
+        return;
+    }
+
+    /* parse key */
+    opt.alg = QCRYPTO_AK_CIPHER_ALGO_RSA;
+    opt.u.rsa.padding_alg = QCRYPTO_RSA_PADDING_ALGO_PKCS1;
+    opt.u.rsa.hash_alg = QCRYPTO_HASH_ALGO_SHA256;
+
+    s->rsa_key = qcrypto_akcipher_new(&opt, kt, key_buf, key_len, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+}
+
+static void pcisign_realize(PCIDevice *pdev, Error **errp)
+{
+    PCISignDevState *s = PCI_SIGN_DEV(pdev);
+    Error *local_err = NULL;
+
+    qemu_mutex_init(&s->lock);
+
+    /* mark this device as a PCIe endpoint */
+    pcie_endpoint_cap_init(pdev, 0);
+
+    /* config space */
+    pci_config_set_vendor_id(pdev->config, 0x1234);
+    pci_config_set_device_id(pdev->config, 0xCAFE);
+    pci_config_set_class(pdev->config, PCI_CLASS_OTHERS);
+
+    /* disable INTx */
+    pci_config_set_interrupt_pin(pdev->config, 0);
+
+    /* BAR0: MMIO */
+    memory_region_init_io(&s->mmio, OBJECT(s), &pcisign_mmio_ops, s,
+                          "pcisign-mmio", 0x1000);
+    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+
+    /*
+     * BAR1: MSI-X table + PBA, managed entirely by QEMU.
+     */
+    if (msix_init_exclusive_bar(pdev, PCISIGN_MSIX_NUM_VECTORS,
+                                PCISIGN_MSIX_BAR, &local_err)) {
+        if (local_err) {
+            error_propagate(errp, local_err);
+        }
+        return;
+    }
+
+    msix_vector_use(pdev, 0);
+
+    pcisign_init_keys(s, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+}
+
+static void pcisign_reset(DeviceState *dev)
+{
+    PCISignDevState *s = PCI_SIGN_DEV(dev);
+
+    memset(&s->regs, 0, sizeof(s->regs));
+}
+
+static void pcisign_unrealize(PCIDevice *pdev)
+{
+    PCISignDevState *s = PCI_SIGN_DEV(pdev);
+
+    msix_vector_unuse(pdev, 0);
+    msix_uninit_exclusive_bar(pdev);
+
+    g_free(s->rsa_key);
+
+    qemu_mutex_destroy(&s->lock);
+}
+
+static Property pcisign_properties[] = {
+    DEFINE_PROP_STRING("rsa-key", PCISignDevState, rsa_key_path),
+};
+
+static void pcisign_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize   = pcisign_realize;
+    k->exit      = pcisign_unrealize;
+
+    device_class_set_props(dc, pcisign_properties);
+    device_class_set_legacy_reset(dc, pcisign_reset);
+
+    /* TODO: dc->vmsd later for migration */
+}
+
+static const TypeInfo pcisign_info = {
+    .name          = TYPE_PCI_SIGN_DEV,
+    .parent        = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(PCISignDevState),
+    .class_init    = pcisign_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { INTERFACE_PCIE_DEVICE },
+        { },
+    },
+};
+
+static void pcisign_register_types(void)
+{
+    type_register_static(&pcisign_info);
+}
+
+type_init(pcisign_register_types);
