@@ -40,13 +40,13 @@ The device should report success in the kernel log when loaded.
 ```bash
 cd kernel
 make
-insomod pcisign.ko
+sudo insmod pcisign.ko
 ```
 
 ### Test
 
 ```bash
 cd kernel
-gcc -o test_pcisign test_pcisign.c
+make test_pcisign
 sudo ./test_pcisign
 ```
