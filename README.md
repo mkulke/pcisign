@@ -20,7 +20,7 @@ make -j$(nproc)
 
 ### Run
 
-specify `-device pcisign` in your QEMU command line
+specify `-device pcisign,rsa-key=/tmp/rsa2048.key` in your QEMU command line. The key has to be a private RSA key formatted in PKCS#1 and encoded in DER. In OpenSSL v3 this would be achieved by using those conversion flags: `-outform DER -traditional` 
 
 ## Kernel driver (frontend)
 
